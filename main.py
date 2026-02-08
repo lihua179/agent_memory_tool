@@ -18,9 +18,6 @@ import numpy as np
 from scipy.sparse import csr_matrix
 from multi_words_search_roads import find_top_inference_paths
 
-
-
-
 # 初始化一个逻辑上很大但实际不占空间的稀疏矩阵
 # 假设最大支持 100万个词
 max_dim = 100000
@@ -32,7 +29,7 @@ sparse_memory = dok_matrix((max_dim, max_dim), dtype=int)
 # sparse_memory[i, j] += 1
 base_path = fr"D:\sina_news\sina_news_data\tag_0"
 file_list = get_file(base_path)
-file_list = file_list[:2]
+file_list = file_list[:20]
 # print(file_list)
 
 # elf.vocab = vocab_list
@@ -40,6 +37,7 @@ file_list = file_list[:2]
 #         self.dim = len(vocab_list)
 # {word: i for i, word in enumerate(vocab_list)
 vocab_dict = {}
+idx_to_word = {}
 vocab_count = 0
 sparse_memory_list = []
 total_news = 0
@@ -68,6 +66,7 @@ for file in file_list:
         for word in clean_words:
             if word not in vocab_dict:
                 vocab_dict[word] = vocab_count
+                idx_to_word[vocab_count] = word
                 vocab_count += 1
             index_list.append(vocab_dict[word])
             # zero_list_copy[vocab_dict[word]]=1
@@ -78,7 +77,7 @@ for file in file_list:
         # print(sparse_memory_copy)
         if sparse_memory_list:
             # 第n词，向量库存储够了，我们开始推理吧！我们开始统计这次的累积概率。我们首先进行累加操作
-            if total_news >= 2000:
+            if total_news >= 1000:
                 now_csr_sparse_memory = sparse_memory_copy.tocsr()
                 cumulate_sparse_memory = now_csr_sparse_memory
                 for sparse_memory in sparse_memory_list:
@@ -90,6 +89,24 @@ for file in file_list:
                 cumulate_sparse_memory = cumulate_sparse_memory.todok()
 
                 # 下一步，我们计算每个俩俩组成的元素，它们相对各自元素（两个）同时出现的概率矩阵
+                # 在此之前，把那些过于小的，去掉，这种行为称之为去噪或者剪枝
+
+                # 假设 cumulate_sparse_memory 是你的累计共现矩阵 (DOK 或 CSR)
+                # 转换为 CSR 格式以便快速操作数据
+                m_csr = cumulate_sparse_memory.tocsr()
+
+                # 设定阈值：共现必须大于等于 3 次才算有效
+                min_cooccurrence = 10
+
+                # 直接操作内部数据数组，效率极高
+                m_csr.data[m_csr.data < min_cooccurrence] = 0
+
+                # 去除那些变成 0 的槽位，减小矩阵体积
+                m_csr.eliminate_zeros()
+
+                # find_top_inference_paths(prob_matrix, vocab_dict, start_word, top_n=5)
+                # .todok()
+                cumulate_sparse_memory = m_csr
                 # # 1. 提取对角线作为分母 (A出现的总次数)
                 diag = cumulate_sparse_memory.diagonal()
                 #
@@ -101,12 +118,28 @@ for file in file_list:
                 # 得到的结果 P[i,j] 就是：看到词 i 后，有多大概念能想到词 j
 
                 inv_diag_matrix = diags(1.0 / diag)
-                prob_matrix = inv_diag_matrix @ sparse_memory.tocsr()
+                prob_matrix = inv_diag_matrix @ cumulate_sparse_memory.tocsr()
+
+                # print()
+                # 转换为坐标格式
+                coo = prob_matrix.tocoo()
+
+                # idx_to_word=idx_to_word
+                # 直接遍历非零元素
+                for r, c, v in zip(coo.row, coo.col, coo.data):
+                    # r 是起点词索引, c 是目标词索引, v 是概率
+                    if 1 > v >= 0.2:  # 顺便过滤掉微弱的噪音
+                        word_a = idx_to_word[r]
+                        word_b = idx_to_word[c]
+                        print(f"{word_a} -> {word_b}: {v:.4f}")
+
                 #
                 # 现在，prob_matrix[idx_A, idx_B] 就是从 A 推导 B 的概率
-                print(prob_matrix.shape[0])
-                start_word = '美国'
-                res = find_top_inference_paths(prob_matrix, vocab_dict, start_word, top_n=2)
+                # print(prob_matrix[0,1])
+                # print(prob_matrix[1,0])
+                # print(prob_matrix.shape[0])
+                start_word = '经营'
+                res = find_top_inference_paths(prob_matrix, vocab_dict, start_word, top_n=3)
                 print(res)
                 time.sleep(1000)
 
