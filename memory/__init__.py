@@ -40,6 +40,6 @@ from .cooccurrence import IncrementalCooccurrence
 from .probability import compute_ppmi_matrix, compute_conditional_prob_matrix
 from .decay import DecayManager
 from .inference import find_top_inference_paths, find_group_inference_paths, beam_search_inference
-from .storage import MemoryStore, extract_keywords_jieba
+from .storage import MemoryStore, extract_keywords_jieba, extract_nouns_jieba, extract_keywords_weighted, parse_time_expression
 from .chain import discover_hidden_chain, discover_hidden_chain_with_evidence
 from .retriever import MemoryRetriever, count_tokens

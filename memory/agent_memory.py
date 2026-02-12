@@ -58,7 +58,7 @@ from scipy.sparse import save_npz, load_npz
 from .cooccurrence import IncrementalCooccurrence
 from .probability import compute_ppmi_matrix, compute_conditional_prob_matrix
 from .decay import DecayManager
-from .storage import MemoryStore, extract_keywords_jieba
+from .storage import MemoryStore, extract_keywords_jieba, extract_nouns_jieba, parse_time_expression
 from .retriever import MemoryRetriever
 from .chain import discover_hidden_chain, discover_hidden_chain_with_evidence
 
@@ -250,9 +250,37 @@ class AgentMemory:
 
         # 同步学习: 将条目的关键词注入共现矩阵（Channel B）
         entry = self._store.get(entry_id)
-        if entry and entry.get("keywords") and len(entry["keywords"]) >= 2:
-            self._cooccurrence.add_keywords(entry["keywords"])
-            self._matrices_dirty = True
+        if entry:
+            ai_gave_keywords = bool(keywords)  # AI 主动给了 keywords
+            entry_keywords = entry.get("keywords") or []
+
+            if ai_gave_keywords and len(entry_keywords) >= 2:
+                # AI 主动给关键词 → 信任 AI，只用 keywords 做共现
+                self._cooccurrence.add_keywords(entry_keywords)
+                self._matrices_dirty = True
+            elif not ai_gave_keywords:
+                # 自动模式 → 从 topic + keywords + summary 提取名词性概念词
+                # extract_nouns_jieba 返回 [(word, weight), ...] 按 TF-IDF 权重降序
+                text_parts = []
+                if entry.get("topic"):
+                    text_parts.append(entry["topic"])
+                if entry_keywords:
+                    text_parts.extend(entry_keywords)
+                if entry.get("summary"):
+                    text_parts.append(entry["summary"])
+                combined_text = " ".join(text_parts)
+                noun_pairs = extract_nouns_jieba(combined_text, top_k=20)
+                nouns = [w for w, _ in noun_pairs]
+                # 将自动提取的 keywords 也并入（它们通过 auto_extract 得到，
+                # 可能包含非名词，但已经过 extract_keywords_jieba 过滤）
+                noun_set = set(nouns)
+                for kw in entry_keywords:
+                    if kw not in noun_set:
+                        noun_set.add(kw)
+                        nouns.append(kw)
+                if len(nouns) >= 2:
+                    self._cooccurrence.add_keywords(nouns)
+                    self._matrices_dirty = True
 
         return entry_id
 
@@ -299,7 +327,9 @@ class AgentMemory:
 
     def query(self, keywords=None, user_input=None, depth="standard",
               token_budget=1000, time_recent=None, time_range=None,
-              source_filter=None, top_n_expand=10, top_n_entries=10):
+              source_filter=None, top_n_expand=10, top_n_entries=10,
+              chain_fuzzy=False, auto_parse_time=False,
+              long_threshold=80, core_ratio=0.2, important_ratio=0.4):
         """
         多级记忆查询，返回可直接注入 prompt 的结果。
 
@@ -316,6 +346,16 @@ class AgentMemory:
             source_filter: str | None - 只搜某个 agent 的记忆
             top_n_expand: int - 关联扩展取 top-N 关联词
             top_n_entries: int - 最终返回最多几条
+            chain_fuzzy: bool - 隐藏链推理词是否也做模糊匹配（默认 False）
+            auto_parse_time: bool - 是否自动从 user_input 中解析时间表达式
+                为 True 时，会自动识别中文时间表达式（如"上周""前两个月"），
+                将其转换为 time_range 约束，并从搜索关键词中剔除时间词。
+                仅在 user_input 非空且未显式传入 time_range/time_recent 时生效。
+            long_threshold: int - 长文本模式触发阈值（字符数），默认 80
+                超过此长度的 user_input 将使用 TF-IDF 分级提取关键词，
+                避免关键词爆炸导致搜索噪声。
+            core_ratio: float - 长文本模式下核心词占提取总词数的比例，默认 0.2
+            important_ratio: float - 长文本模式下重要词占提取总词数的比例，默认 0.4
 
         返回:
             dict - {
@@ -324,8 +364,18 @@ class AgentMemory:
                 "expanded_keywords": list, # 关联扩展词
                 "chain": dict | None,      # 推理链（deep 才有）
                 "search_stats": dict,      # 搜索统计
+                "parsed_time": dict | None, # 时间解析结果（auto_parse_time=True 时）
             }
         """
+        # ---- 时间表达式自动解析 ----
+        parsed_time_info = None
+        if auto_parse_time and user_input and time_range is None and time_recent is None:
+            parsed = parse_time_expression(user_input)
+            if parsed["time_range"] is not None:
+                time_range = parsed["time_range"]
+                user_input = parsed["cleaned_text"]
+                parsed_time_info = parsed
+
         # 确保检索器可用
         self._ensure_retriever()
 
@@ -340,7 +390,14 @@ class AgentMemory:
             source_filter=source_filter,
             top_n_expand=top_n_expand,
             top_n_entries=top_n_entries,
+            chain_fuzzy=chain_fuzzy,
+            long_threshold=long_threshold,
+            core_ratio=core_ratio,
+            important_ratio=important_ratio,
         )
+
+        # 附加时间解析信息
+        result["parsed_time"] = parsed_time_info
 
         # 提取强化: 递增命中条目的 access_count
         matched = result.get("matched_entries", [])

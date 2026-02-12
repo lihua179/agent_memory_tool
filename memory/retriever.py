@@ -2,10 +2,19 @@
 """
 多级记忆检索器
 
-三级检索深度：
+四级检索深度：
     fast     — Tier 0 精确 + Tier 1 模糊          （毫秒级）
     standard — Tier 0+1 + Tier 2 PPMI 关联扩展     （百毫秒级）
     deep     — Tier 0+1+2 + Tier 3 隐藏链推理      （秒级）
+
+长文本智能处理：
+    当输入超过 long_threshold 字时，使用 TF-IDF 提取带权重的关键词，
+    按权重分为核心词/重要词/补充词，各 Tier 使用不同的关键词集合：
+        Tier 0 精确: 核心词 + 重要词
+        Tier 1 模糊: 仅核心词
+        Tier 2 扩展: 仅核心词
+        Tier 3 链:   仅核心词
+    补充词在评分阶段用于二次验证（加分不扣分）。
 
 分层加载策略（在 token 预算内尽量多加信息）：
     最相关条目: topic → keywords → summary → body（截断）
@@ -20,7 +29,7 @@ import time
 import numpy as np
 import tiktoken
 
-from .storage import MemoryStore, extract_keywords_jieba
+from .storage import MemoryStore, extract_keywords_jieba, extract_keywords_weighted
 from .chain import discover_hidden_chain
 
 
@@ -77,11 +86,15 @@ class MemoryRetriever:
         self.ppmi_matrix = ppmi_matrix
         self.vocab_dict = vocab_dict
         self.cooccurrence_matrix = cooccurrence_matrix
+        # 缓存反向映射 idx→word，避免每次 _expand_keywords 都重建
+        self._idx_to_word = {v: k for k, v in vocab_dict.items()} if vocab_dict else {}
 
     def set_association_matrix(self, ppmi_matrix, vocab_dict, cooccurrence_matrix=None):
         """设置或更新 PPMI 关联矩阵"""
         self.ppmi_matrix = ppmi_matrix
         self.vocab_dict = vocab_dict
+        # 更新反向映射缓存
+        self._idx_to_word = {v: k for k, v in vocab_dict.items()} if vocab_dict else {}
         if cooccurrence_matrix is not None:
             self.cooccurrence_matrix = cooccurrence_matrix
 
@@ -99,12 +112,16 @@ class MemoryRetriever:
                  time_decay=0.1,
                  source_filter=None,
                  top_n_expand=10,
-                 top_n_entries=10):
+                 top_n_entries=10,
+                 chain_fuzzy=False,
+                 long_threshold=80,
+                 core_ratio=0.2,
+                 important_ratio=0.4):
         """
         多级记忆检索。
 
         参数:
-            user_input:    str | None — 原始用户输入文本（自动 jieba 提取关键词）
+            user_input:    str | None — 原始用户输入文本（自动提取关键词）
             keywords:      list[str] | None — AI 直接给的关键词（优先级高于 user_input）
             depth:         str — "fast" / "standard" / "deep"
             token_budget:  int — prompt 注入的最大 token 数
@@ -114,6 +131,10 @@ class MemoryRetriever:
             source_filter: str | None — 只搜某个智能体的记忆
             top_n_expand:  int — 关联扩展时取 top-N 关联词
             top_n_entries: int — 最终返回最多几条记忆条目
+            chain_fuzzy:   bool — 隐藏链推理词是否也做模糊匹配（默认 False）
+            long_threshold: int — 长文本模式触发阈值（字符数），默认 80
+            core_ratio:    float — 核心词占提取总词数的比例，默认 0.2
+            important_ratio: float — 重要词占提取总词数的比例，默认 0.4
 
         返回:
             dict — {
@@ -132,25 +153,80 @@ class MemoryRetriever:
             "exact_hits": 0,
             "fuzzy_hits": 0,
             "assoc_hits": 0,
+            "long_text_mode": False,
             "time_ms": 0,
         }
 
-        # === Step 0: 确定查询关键词 ===
-        query_keywords = []
-        if keywords:
-            query_keywords = list(keywords)
-        if user_input and not query_keywords:
-            query_keywords = extract_keywords_jieba(user_input)
-        # 两者都给了，合并去重
-        if keywords and user_input:
-            auto_kw = extract_keywords_jieba(user_input)
-            merged = list(keywords)
-            for w in auto_kw:
-                if w not in merged:
-                    merged.append(w)
-            query_keywords = merged
+        # === Step 0: 确定查询关键词（含长文本智能分级） ===
 
-        if not query_keywords:
+        # AI 直接给的关键词（已经过 AI 判断，视为核心）
+        ai_keywords = list(keywords) if keywords else []
+
+        # 判断是否长文本模式
+        is_long = (user_input and isinstance(user_input, str)
+                   and len(user_input) > long_threshold)
+
+        if is_long:
+            # ---- 长文本模式：TF-IDF 提取 + 分级 ----
+            stats["long_text_mode"] = True
+            weighted_kws = extract_keywords_weighted(
+                user_input, top_k=25, long_threshold=long_threshold)
+
+            # 去掉 AI 已给的关键词（避免重复）
+            ai_set = set(ai_keywords)
+            weighted_kws = [(w, s) for w, s in weighted_kws if w not in ai_set]
+
+            total = len(weighted_kws)
+            core_count = max(3, int(total * core_ratio))
+            important_count = max(3, int(total * important_ratio))
+
+            # 分三级（weighted_kws 已按权重降序）
+            core_words = [w for w, _ in weighted_kws[:core_count]]
+            important_words = [w for w, _ in weighted_kws[core_count:core_count + important_count]]
+            supplement_words = [w for w, _ in weighted_kws[core_count + important_count:]]
+
+            # AI 给的关键词并入核心词（它们是 AI 已判断过的重点）
+            core_keywords = ai_keywords + core_words
+
+            # 各 Tier 使用的关键词集合
+            tier0_keywords = core_keywords + important_words    # 精确: 核心 + 重要
+            tier1_keywords = core_keywords                      # 模糊: 仅核心
+            tier2_keywords = core_keywords                      # 扩展: 仅核心
+            tier3_keywords = core_keywords                      # 链:   仅核心
+
+            stats["core_keywords"] = core_keywords
+            stats["important_keywords"] = important_words
+            stats["supplement_keywords"] = supplement_words
+
+        else:
+            # ---- 短文本模式：原有逻辑不变 ----
+            if ai_keywords and user_input:
+                # 两者都给了，合并去重
+                auto_kw = extract_keywords_jieba(user_input)
+                merged = list(ai_keywords)
+                for w in auto_kw:
+                    if w not in merged:
+                        merged.append(w)
+                query_keywords = merged
+            elif ai_keywords:
+                query_keywords = ai_keywords
+            elif user_input:
+                query_keywords = extract_keywords_jieba(user_input)
+            else:
+                query_keywords = []
+
+            if not query_keywords:
+                return self._empty_result(stats, t_start)
+
+            # 短文本：所有 Tier 用同一组关键词
+            tier0_keywords = query_keywords
+            tier1_keywords = query_keywords
+            tier2_keywords = query_keywords
+            tier3_keywords = query_keywords
+            core_keywords = query_keywords
+            supplement_words = []
+
+        if not tier0_keywords:
             return self._empty_result(stats, t_start)
 
         # === Step 1: 时间范围预过滤（确定候选池） ===
@@ -167,7 +243,7 @@ class MemoryRetriever:
             candidate_pool = None   # None 表示不限制
 
         # === Step 2: Tier 0 精确匹配 ===
-        exact_hits = self.store.search_exact(query_keywords)
+        exact_hits = self.store.search_exact(tier0_keywords)
         if candidate_pool is not None:
             exact_hits = {eid: n for eid, n in exact_hits.items()
                           if eid in candidate_pool}
@@ -177,7 +253,7 @@ class MemoryRetriever:
         stats["exact_hits"] = len(exact_hits)
 
         # === Step 3: Tier 1 模糊匹配 ===
-        fuzzy_hits = self.store.search_fuzzy(query_keywords)
+        fuzzy_hits = self.store.search_fuzzy(tier1_keywords)
         if candidate_pool is not None:
             fuzzy_hits = {eid: s for eid, s in fuzzy_hits.items()
                           if eid in candidate_pool}
@@ -191,7 +267,7 @@ class MemoryRetriever:
         assoc_hits = {}
 
         if depth in ("standard", "deep") and self.ppmi_matrix is not None and self.vocab_dict is not None:
-            expanded_keywords = self._expand_keywords(query_keywords, top_n=top_n_expand)
+            expanded_keywords = self._expand_keywords(tier2_keywords, top_n=top_n_expand)
             if expanded_keywords:
                 assoc_exact = self.store.search_exact(expanded_keywords)
                 assoc_fuzzy = self.store.search_fuzzy(expanded_keywords)
@@ -209,9 +285,9 @@ class MemoryRetriever:
         # === Step 5: Tier 3 隐藏链推理（deep）===
         chain_result = None
         if depth == "deep" and self.ppmi_matrix is not None and self.vocab_dict is not None:
-            if len(query_keywords) >= 2:
+            if len(tier3_keywords) >= 2:
                 chain_result = discover_hidden_chain(
-                    self.ppmi_matrix, self.vocab_dict, query_keywords,
+                    self.ppmi_matrix, self.vocab_dict, tier3_keywords,
                     top_k_candidates=50, alpha=0.85, min_edge_weight=0.1, top_n=10,
                     fallback_matrix=self.cooccurrence_matrix
                 )
@@ -223,6 +299,13 @@ class MemoryRetriever:
                         if candidate_pool is not None and eid not in candidate_pool:
                             continue
                         assoc_hits[eid] = assoc_hits.get(eid, 0) + n * 0.4
+                    # 可选：隐藏链词也做模糊匹配
+                    if chain_fuzzy:
+                        chain_fuzzy_hits = self.store.search_fuzzy(chain_words)
+                        for eid, s in chain_fuzzy_hits.items():
+                            if candidate_pool is not None and eid not in candidate_pool:
+                                continue
+                            assoc_hits[eid] = max(assoc_hits.get(eid, 0), s * 0.2)
 
         # === Step 6: 综合评分 ===
         all_entry_ids = set(exact_hits.keys()) | set(fuzzy_hits.keys()) | set(assoc_hits.keys())
@@ -241,6 +324,18 @@ class MemoryRetriever:
             fuzzy_score = fuzzy_hits.get(eid, 0)
             assoc_score = assoc_hits.get(eid, 0)
             relevance = exact_score * 1.0 + fuzzy_score * 0.6 + assoc_score * 0.4
+
+            # 长文本模式：补充词二次验证（加分不扣分）
+            if supplement_words:
+                entry_kws = set(entry.get("keywords") or [])
+                entry_text = (entry.get("summary") or "") + (entry.get("body") or "")
+                supplement_match = 0
+                for sw in supplement_words:
+                    if sw in entry_kws or sw in entry_text:
+                        supplement_match += 1
+                # 验证系数 1.0 ~ 1.5（命中全部补充词时为 1.5）
+                verify_bonus = 1.0 + 0.5 * (supplement_match / len(supplement_words))
+                relevance *= verify_bonus
 
             # 时间维度（反比衰减，importance 感知）
             entry_importance = entry.get("importance", 3)
@@ -270,7 +365,7 @@ class MemoryRetriever:
 
         # === Step 7: 分层加载（token 预算内）===
         prompt_text, loaded_info = self._layered_load(scored_entries, token_budget,
-                                                      expanded_keywords)
+                                                      expanded_keywords, chain_result)
 
         stats["time_ms"] = round((time.time() - t_start) * 1000, 2)
 
@@ -287,6 +382,7 @@ class MemoryRetriever:
                 "time_weight": se["time_weight"],
                 "importance": entry.get("importance", 3),
                 "final_score": se["final_score"],
+                "timestamp": entry.get("timestamp"),
                 "age_hours": se["age_hours"],
                 "loaded_layers": loaded_info.get(se["entry_id"], []),
             })
@@ -324,10 +420,9 @@ class MemoryRetriever:
 
             # 找非零项
             nonzero = np.where(row > 0)[0]
-            idx_to_word = {v: k for k, v in self.vocab_dict.items()}
 
             for nz_idx in nonzero:
-                w = idx_to_word.get(nz_idx)
+                w = self._idx_to_word.get(nz_idx)
                 if w is None or w in input_set:
                     continue
                 score = row[nz_idx]
@@ -341,7 +436,8 @@ class MemoryRetriever:
     # 分层加载
     # ========================
 
-    def _layered_load(self, scored_entries, token_budget, expanded_keywords=None):
+    def _layered_load(self, scored_entries, token_budget, expanded_keywords=None,
+                      chain_result=None):
         """
         在 token 预算内分层加载记忆条目。
 
@@ -376,6 +472,14 @@ class MemoryRetriever:
             entry_prefix = f"\n--- 记忆 #{i+1} "
             if entry.get("source"):
                 entry_prefix += f"[来源:{entry['source']}] "
+            # 绝对时间
+            import time as _time
+            ts = entry.get("timestamp")
+            if ts:
+                abs_time = _time.strftime("%Y-%m-%d %H:%M", _time.localtime(ts))
+                entry_prefix += f"[{abs_time}] "
+
+            # 相对时间
             age_h = se["age_hours"]
             if age_h < 1:
                 entry_prefix += f"[{age_h*60:.0f}分钟前]"
@@ -463,6 +567,35 @@ class MemoryRetriever:
             if t <= token_budget - used_tokens:
                 parts.append(hint)
                 used_tokens += t
+
+        # 附加推理链提示（deep 模式，如有预算）
+        if chain_result and (token_budget - used_tokens) > 30:
+            chain_parts = []
+
+            # 隐藏关联词
+            hidden = chain_result.get("hidden_words", [])
+            if hidden:
+                hw_list = [hw["word"] for hw in hidden[:6]]
+                chain_parts.append(f"[隐藏关联] {', '.join(hw_list)}")
+
+            # 推理路径
+            valid_chains = chain_result.get("chains", [])
+            if valid_chains:
+                chain_parts.append("[推理路径]")
+                for c in valid_chains[:3]:  # 最多展示 3 条路径
+                    path = c.get("path")
+                    if path:
+                        chain_parts.append(
+                            f"  {c['from']} → {' → '.join(path[1:-1])} → {c['to']}"
+                            f" (关联强度:{c['total_weight']:.3f})"
+                        )
+
+            if chain_parts:
+                chain_text = "\n" + "\n".join(chain_parts) + "\n"
+                t = count_tokens(chain_text)
+                if t <= token_budget - used_tokens:
+                    parts.append(chain_text)
+                    used_tokens += t
 
         prompt_text = "".join(parts)
         return prompt_text, loaded_info
